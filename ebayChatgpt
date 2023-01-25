@@ -1,0 +1,39 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Get user input for search term
+search_term = input("Enter search term for sports card: ")
+
+# Request page from eBay
+url = f"https://www.ebay.com/sch/i.html?_nkw={search_term}"
+page = requests.get(url)
+
+# Parse page with BeautifulSoup
+soup = BeautifulSoup(page.content, 'html.parser')
+
+# Find all card listings on page
+card_listings = soup.find_all('li', class_='s-item')
+
+# Initialize empty list to hold card prices
+prices = []
+
+# Loop through card listings
+for listing in card_listings:
+    # Try to find price of card
+    try:
+        price = float(listing.find('span', class_='s-price').get_text()[1:].replace(',',''))
+        prices.append(price)
+    except:
+        pass
+
+# Create dataframe from prices
+df = pd.DataFrame({'price': prices})
+
+# Plot trend chart of prices
+df.plot(kind='line')
+plt.xlabel('Listing Number')
+plt.ylabel('Price')
+plt.title(f'Price Trend for {search_term}')
+plt.show()
