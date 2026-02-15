@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
+from xml.etree import ElementTree
 
 HOST = "0.0.0.0"
 PORT = 5000
@@ -17,6 +19,7 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/123.0.0.0 Safari/537.36"
 )
+EBAY_APP_ID = os.getenv("EBAY_APP_ID", "").strip()
 
 INDEX_HTML = """<!doctype html>
 <html lang="en">
@@ -187,6 +190,103 @@ def fetch_sold_items(query: str, limit: int = 60) -> list[dict[str, Any]]:
     return listings
 
 
+def _xml_text(node: ElementTree.Element | None, path: str) -> str | None:
+    if node is None:
+        return None
+    found = node.find(path)
+    if found is None or found.text is None:
+        return None
+    return found.text.strip()
+
+
+def fetch_sold_items_finding_api(query: str, limit: int = 60) -> list[dict[str, Any]]:
+    if not EBAY_APP_ID:
+        return []
+
+    params = {
+        "OPERATION-NAME": "findCompletedItems",
+        "SERVICE-VERSION": "1.13.0",
+        "SECURITY-APPNAME": EBAY_APP_ID,
+        "RESPONSE-DATA-FORMAT": "XML",
+        "REST-PAYLOAD": "",
+        "keywords": query,
+        "itemFilter(0).name": "SoldItemsOnly",
+        "itemFilter(0).value": "true",
+        "sortOrder": "EndTimeSoonest",
+        "paginationInput.entriesPerPage": str(min(limit, 100)),
+    }
+    url = f"https://svcs.ebay.com/services/search/FindingService/v1?{urlencode(params)}"
+    req = Request(url, headers={"User-Agent": USER_AGENT, "X-EBAY-SOA-SECURITY-APPNAME": EBAY_APP_ID})
+
+    with urlopen(req, timeout=20) as response:  # nosec B310
+        payload = response.read().decode("utf-8", errors="ignore")
+
+    root = ElementTree.fromstring(payload)
+    namespace = {"n": "http://www.ebay.com/marketplace/search/v1/services"}
+    items = root.findall(".//n:item", namespace)
+
+    listings: list[dict[str, Any]] = []
+    for item in items:
+        title = _xml_text(item, "n:title")
+        price_raw = _xml_text(item, "n:sellingStatus/n:currentPrice")
+        sold_date_raw = _xml_text(item, "n:listingInfo/n:endTime")
+        if not title or not price_raw:
+            continue
+
+        try:
+            price = float(price_raw)
+        except ValueError:
+            continue
+
+        sold_date = None
+        if sold_date_raw:
+            sold_date = sold_date_raw.split("T", maxsplit=1)[0]
+
+        listings.append(
+            {
+                "title": title,
+                "price": price,
+                "price_display": f"${price:,.2f}",
+                "sold_date": sold_date,
+            }
+        )
+
+        if len(listings) >= limit:
+            break
+
+    return listings
+
+
+def fetch_sold_items_with_fallback(query: str, limit: int = 60) -> list[dict[str, Any]]:
+    api_error: Exception | None = None
+    if EBAY_APP_ID:
+        try:
+            api_results = fetch_sold_items_finding_api(query, limit=limit)
+            if api_results:
+                return api_results
+        except Exception as exc:  # noqa: BLE001
+            api_error = exc
+
+    try:
+        return fetch_sold_items(query, limit=limit)
+    except HTTPError as exc:
+        if exc.code == 403:
+            raise RuntimeError(
+                "eBay blocked the scraping request (HTTP 403). "
+                "Set EBAY_APP_ID to use the official Finding API fallback."
+            ) from exc
+        raise
+    except URLError as exc:
+        if "403" in str(exc):
+            raise RuntimeError(
+                "Network/proxy blocked access to eBay (403). "
+                "If this persists, set EBAY_APP_ID to use the official API path."
+            ) from exc
+        if api_error is not None:
+            raise RuntimeError(f"API fallback failed first: {api_error}") from api_error
+        raise
+
+
 class EbayTrendHandler(BaseHTTPRequestHandler):
     def _send_json(self, payload: dict[str, Any], status_code: int = 200) -> None:
         response_bytes = json.dumps(payload).encode("utf-8")
@@ -219,8 +319,8 @@ class EbayTrendHandler(BaseHTTPRequestHandler):
                 return
 
             try:
-                items = fetch_sold_items(query)
-            except (HTTPError, URLError, TimeoutError) as exc:
+                items = fetch_sold_items_with_fallback(query)
+            except (HTTPError, URLError, TimeoutError, RuntimeError, ElementTree.ParseError) as exc:
                 self._send_json({"error": f"Could not reach eBay: {exc}"}, 502)
                 return
 
